@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Voxel Game of Life - Toric Knowledge Graph</title>
+<style>
+  body { margin: 0; overflow: hidden; font-family: 'Courier New', monospace; background: #0a0a0a; }
+  #ui { position: fixed; top: 10px; left: 10px; z-index: 100; display: flex; flex-direction: column; gap: 10px; }
+  button { padding: 10px 20px; background: linear-gradient(135deg, #1a1a3a, #2a2a4a); color: #aaffff; border: 1px solid rgba(100, 200, 255, 0.5); border-radius: 8px; cursor: pointer; }
+  #paper-canvas { position: fixed; right: 10px; top: 10px; border: 2px solid rgba(100,200,255,0.3); border-radius: 10px; background: rgba(0,0,0,0.8); }
+  #pattern-browser { position: fixed; right: 10px; top: 430px; width: 300px; max-height: 50vh; overflow-y: auto; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 10px; color: white; }
+  .pattern-item { margin-bottom: 10px; padding: 10px; background: rgba(255,255,255,0.1); border-radius: 5px; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/paper.js/0.12.15/paper-full.min.js"></script>
+</head>
+<body>
+<div id="ui">
+  <button id="playBtn">▶ Play</button>
+  <button id="reverseBtn">◀ Reverse</button>
+  <button id="resetBtn">⟲ Reset</button>
+  <button id="savePatternBtn">💾 Save Pattern</button>
+</div>
+<canvas id="paper-canvas" width="400" height="400"></canvas>
+<div id="pattern-browser"><h3>📊 Pattern Memory</h3><div id="gallery"></div></div>
+
+<script type="module">
+// ==================== CORE SYSTEMS ====================
+class ToricKnowledgeNode {
+  constructor(id, pattern, generation, toricEmbedding, metadata) {
+    this.id = id; this.pattern = pattern; this.generation = generation;
+    this.toricEmbedding = toricEmbedding; this.metadata = metadata;
+  }
+}
+
+class PineconeMemory {
+  constructor() {
+    this.index = new Map(); this.history = [];
+  }
+  computeToricEmbedding(pattern) {
+    const theta = pattern.reduce((sum, val, i) => sum + val * Math.cos(i * 0.1), 0);
+    const phi = pattern.reduce((sum, val, i) => sum + val * Math.sin(i * 0.1), 0);
+    return [theta % (2 * Math.PI), phi % (2 * Math.PI)];
+  }
+  async store(pattern, generation) {
+    const id = `gen-${generation}-${Date.now()}`;
+    const node = new ToricKnowledgeNode(id, pattern, generation, this.computeToricEmbedding(pattern), 
+      { timestamp: Date.now(), density: pattern.reduce((s, v) => s + v, 0) / pattern.length });
+    this.index.set(id, node); this.history.push(node); return id;
+  }
+  async querySimilar(pattern, k = 5) {
+    const embedding = this.computeToricEmbedding(pattern);
+    return this.history.map(n => ({ n, d: Math.hypot(n.toricEmbedding[0] - embedding[0], n.toricEmbedding[1] - embedding[1]) }))
+      .sort((a,b) => a.d - b.d).slice(0, k).map(i => i.n);
+  }
+}
+
+class AmbientAudioSynth {
+  constructor() {
+    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    this.oscillators = []; this.gainNodes = []; this.filterNodes = [];
+    for (let i = 0; i < 4; i++) {
+      const osc = this.audioContext.createOscillator();
+      const filter = this.audioContext.createBiquadFilter();
+      const gain = this.audioContext.createGain();
+      osc.type = 'sine'; filter.type = 'lowpass'; filter.frequency.value = 200 + i * 100;
+      gain.gain.value = 0.05; osc.connect(filter); filter.connect(gain); gain.connect(this.audioContext.destination);
+      osc.start(); this.oscillators.push(osc); this.filterNodes.push(filter); this.gainNodes.push(gain);
+    }
+  }
+  updateFromMoment(moment) {
+    const { density, center, toricEmbedding } = moment;
+    const targetGain = 0.02 + density * 0.08;
+    this.gainNodes.forEach((gain, i) => gain.gain.setTargetAtTime(targetGain * (0.5 + 0.5 * Math.sin(Date.now() * 0.001 + i)), this.audioContext.currentTime, 0.5));
+    const freqOffset = center[0] * 10 + center[1] * 20 + center[2] * 30;
+    this.oscillators.forEach((osc, i) => osc.frequency.setTargetAtTime(110 * (i + 1) + freqOffset + density * 50, this.audioContext.currentTime, 0.3));
+    this.filterNodes.forEach(filter => filter.Q.setTargetAtTime(1 + Math.hypot(toricEmbedding[0], toricEmbedding[1]) * 10, this.audioContext.currentTime, 0.2));
+  }
+  async start() { if (this.audioContext.state === 'suspended') await this.audioContext.resume(); }
+}
+
+// ==================== 3D AUTOMATA ====================
+class EnhancedVoxelAutomata3D {
+  constructor(size = 32) {
+    this.size = size; this.grid = new Float32Array(size * size * size);
+    this.nextGrid = new Float32Array(size * size * size); this.generation = 0;
+    this.pinecone = new PineconeMemory(); this.audioSynth = new AmbientAudioSynth();
+    for (let i = 0; i < this.grid.length; i++) this.grid[i] = Math.random() > 0.85 ? 1 : 0;
+  }
+  index(x, y, z) { x = ((x % this.size) + this.size) % this.size; y = ((y % this.size) + this.size) % this.size; z = ((z % this.size) + this.size) % this.size; return x + y * this.size + z * this.size * this.size; }
+  countNeighbors(x, y, z) { let count = 0; for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) if (dx || dy || dz) count += this.grid[this.index(x + dx, y + dy, z + dz)]; return count; }
+  computeAutomataMoment() { const total = this.grid.reduce((s, v) => s + v, 0); const density = total / this.grid.length; let cx = 0, cy = 0, cz = 0; for (let i = 0; i < this.grid.length; i++) { if (this.grid[i] > 0.5) { const x = i % this.size; const y = Math.floor(i / this.size) % this.size; const z = Math.floor(i / (this.size * this.size)); cx += x; cy += y; cz += z; } } return { generation: this.generation, density, center: [cx/total||0, cy/total||0, cz/total||0], total, toricEmbedding: this.pinecone.computeToricEmbedding(this.grid) }; }
+  stepForward() {
+    for (let z = 0; z < this.size; z++) for (let y = 0; y < this.size; y++) for (let x = 0; x < this.size; x++) {
+      const idx = this.index(x, y, z); const neighbors = this.countNeighbors(x, y, z); const alive = this.grid[idx] > 0.5;
+      this.nextGrid[idx] = (alive && (neighbors === 2 || neighbors === 3)) || (!alive && neighbors === 3) ? 1 : 0;
+    }
+    [this.grid, this.nextGrid] = [this.nextGrid, this.grid]; this.generation++;
+    this.pinecone.store(this.grid, this.generation);
+    this.audioSynth.updateFromMoment(this.computeAutomataMoment());
+  }
+  stepReverse(targetPattern) {
+    const learningRate = 0.01;
+    for (let iter = 0; iter < 50; iter++) {
+      let totalError = 0;
+      for (let z = 0; z < this.size; z++) for (let y = 0; y < this.size; y++) for (let x = 0; x < this.size; x++) {
+        const idx = this.index(x, y, z); const current = this.grid[idx];
+        const predictedNext = current > 0.5 ? (this.countNeighbors(x,y,z) === 2 || this.countNeighbors(x,y,z) === 3 ? 1 : 0) : (this.countNeighbors(x,y,z) === 3 ? 1 : 0);
+        const target = targetPattern ? targetPattern[idx] : this.nextGrid[idx];
+        const error = predictedNext - target;
+        this.grid[idx] = Math.max(0, Math.min(1, this.grid[idx] - learningRate * error));
+        totalError += error * error;
+      }
+      if (totalError < 0.001) break;
+    }
+    this.generation = Math.max(0, this.generation - 1);
+  }
+  setVoxel(x, y, z, value) { this.grid[this.index(x, y, z)] = value > 0.5 ? 1 : 0; }
+  getGrid() { return this.grid; }
+  getRuleHighlights() {
+    const highlights = [];
+    for (let z = 0; z < this.size; z++) for (let y = 0; y < this.size; y++) for (let x = 0; x < this.size; x++) {
+      const neighbors = this.countNeighbors(x, y, z); const alive = this.grid[this.index(x, y, z)] > 0.5;
+      if (alive && neighbors === 2) highlights.push({position: [x,y,z], neighborCount: neighbors, type: 'stable'});
+      else if (!alive && neighbors === 3) highlights.push({position: [x,y,z], neighborCount: neighbors, type: 'fertile'});
+      else if (alive && (neighbors < 2 || neighbors > 3)) highlights.push({position: [x,y,z], neighborCount: neighbors, type: 'dying'});
+    }
+    return highlights;
+  }
+}
+
+// ==================== 3D RENDERER ====================
+class HighlightedVoxelRenderer {
+  constructor(container, automata) {
+    this.automata = automata;
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 1000);
+    this.camera.position.set(50, 50, 50); this.camera.lookAt(16, 16, 16);
+    this.renderer = new THREE.WebGLRenderer({ antialias: true }); this.renderer.setSize(container.clientWidth, container.clientHeight);
+    container.appendChild(this.renderer.domElement);
+    this.scene.add(new THREE.AmbientLight(0x404040));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1); dirLight.position.set(50, 50, 50); this.scene.add(dirLight);
+    
+    const geo = new THREE.BoxGeometry(0.8, 0.8, 0.8); const mat = new THREE.MeshLambertMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.8 });
+    this.voxelMesh = new THREE.InstancedMesh(geo, mat, 32**3); this.scene.add(this.voxelMesh);
+    
+    const hGeo = new THREE.BoxGeometry(1.2, 1.2, 1.2); const hMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.6, vertexColors: true });
+    this.highlightMesh = new THREE.InstancedMesh(hGeo, hMat, 1000); this.scene.add(this.highlightMesh);
+    
+    this.setupInteraction(container);
+    this.animate();
+  }
+  
+  setupInteraction(container) {
+    const raycaster = new THREE.Raycaster(); const mouse = new THREE.Vector2();
+    let dragging = false;
+    const handlePointer = (clientX, clientY) => {
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.set
